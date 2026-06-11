@@ -110,12 +110,15 @@ class SecondMomentCollector:
                 idx = torch.randperm(seq, device=x.device)[:self.max_tokens_per_sample]
                 idx = idx.sort()[0]
                 x = x[:, idx, :]
-            x = x.detach().reshape(-1, x.shape[-1]).float().cpu()   # [T, in]
-            xtx = (x.t() @ x).double()                              # [in, in]
-            xs = x.sum(dim=0).double()                              # [in]
+            # Keep the matmul ON DEVICE in fp32. x^T x is [in,in] but the GEMM
+            # runs on GPU; only the running accumulator is touched per call.
+            # (CPU fp64 outer-product every forward was the calibration bottleneck.)
+            x = x.detach().reshape(-1, x.shape[-1]).float()        # [T, in] on device
+            xtx = x.t() @ x                                        # [in, in] on device, fp32
+            xs = x.sum(dim=0)                                      # [in] on device
             if name not in self.HtX:
-                self.HtX[name] = xtx
-                self.sumX[name] = xs
+                self.HtX[name] = xtx.clone()
+                self.sumX[name] = xs.clone()
                 self.count[name] = x.shape[0]
             else:
                 self.HtX[name] += xtx
@@ -124,12 +127,12 @@ class SecondMomentCollector:
         return hook
 
     def finalize(self, name, use_james_stein=True):
-        """Return (H [in,in] fp32, mu [in] fp32) or (None, None)."""
+        """Return (H [in,in] fp32 CPU, mu [in] fp32 CPU) or (None, None)."""
         if name not in self.count or self.count[name] == 0:
             return None, None
         n = self.count[name]
-        H = (self.HtX[name] / n).float()       # [in, in]
-        mu = (self.sumX[name] / n).float()     # [in]
+        H = (self.HtX[name] / n).float().cpu()   # [in, in] -> CPU once, at the end
+        mu = (self.sumX[name] / n).float().cpu()  # [in]
         if use_james_stein:
             mu = compute_james_stein_mean(mu)
         return H, mu
@@ -567,7 +570,17 @@ def calibrate_and_collect(model, tokenizer, layer_batch, calib_texts,
 # =============================================================================
 
 def summarize(records):
-    """Build the headroom curve: per (bits implicit), per d', aggregate stats."""
+    """
+    Build the headroom curve per d'.
+
+    Aggregation note: the gap fraction and the term-attribution fractions are
+    reported as RATIO-OF-SUMS (pool numerators and denominators across rows),
+    not mean-of-per-row-ratios. Per-row ratios blow up on rows where the
+    denominator (gap, or RTN distortion) is ~0 -- a single near-zero-gap row
+    makes mean(clc_recovered/gap) explode to +/-1e6. Pooling is the right
+    estimator for "what fraction of total recoverable distortion does X recover".
+    Per-row medians are kept alongside as a robust cross-check.
+    """
     out = {}
     by_dprime = {}
     for rec in records:
@@ -576,19 +589,41 @@ def summarize(records):
     curve = []
     for dprime in sorted(by_dprime):
         rs = by_dprime[dprime]
-        gfrac = np.array([r["gap_frac"] for r in rs])
-        clc_of_gap = np.array([r["clc_recovered_frac_of_gap"] for r in rs])
-        ro = np.array([r["gap_rank_one_frac"] for r in rs])
-        od = np.array([r["gap_offdiag_frac"] for r in rs])
+        dist_rtn = np.array([r["dist_rtn"] for r in rs])
+        gap = np.array([r["gap"] for r in rs])
+        clc_rec = np.array([r["clc_recovered"] for r in rs])
+        g_ro = np.array([r["gap_rank_one"] for r in rs])
+        g_od = np.array([r["gap_offdiag"] for r in rs])
+
+        sum_rtn = float(dist_rtn.sum())
+        sum_gap = float(gap.sum())
+
+        # per-row fraction, but only over rows with a non-trivial gap, for medians
+        eps = 1e-12
+        nontrivial = gap > (1e-4 * np.maximum(dist_rtn, eps))
+        per_row_gap_frac = gap[nontrivial] / np.maximum(dist_rtn[nontrivial], eps)
+        per_row_clc_of_gap = (clc_rec[nontrivial] /
+                              np.maximum(gap[nontrivial], eps))
+
         curve.append({
             "dprime": dprime,
             "n": len(rs),
-            "gap_frac_mean": float(gfrac.mean()),
-            "gap_frac_median": float(np.median(gfrac)),
-            "gap_frac_p95": float(np.percentile(gfrac, 95)),
-            "clc_recovered_frac_of_gap_mean": float(clc_of_gap.mean()),
-            "gap_rank_one_frac_mean": float(ro.mean()),
-            "gap_offdiag_frac_mean": float(od.mean()),
+            "n_nontrivial_gap": int(nontrivial.sum()),
+            # pooled (ratio-of-sums) -- the headline numbers
+            "gap_frac_pooled": sum_gap / sum_rtn if sum_rtn > 0 else 0.0,
+            "clc_recovered_frac_of_gap_pooled": (float(clc_rec.sum()) / sum_gap
+                                                 if sum_gap > 0 else 0.0),
+            "gap_rank_one_frac_pooled": (float(g_ro.sum()) / sum_gap
+                                         if sum_gap > 0 else 0.0),
+            "gap_offdiag_frac_pooled": (float(g_od.sum()) / sum_gap
+                                        if sum_gap > 0 else 0.0),
+            # robust per-row medians (nontrivial-gap rows only)
+            "gap_frac_median": (float(np.median(per_row_gap_frac))
+                                if per_row_gap_frac.size else 0.0),
+            "gap_frac_p95": (float(np.percentile(per_row_gap_frac, 95))
+                             if per_row_gap_frac.size else 0.0),
+            "clc_of_gap_median": (float(np.median(per_row_clc_of_gap))
+                                  if per_row_clc_of_gap.size else 0.0),
         })
     out["headroom_curve"] = curve
     return out
@@ -722,17 +757,20 @@ def main():
         json.dump({"records": all_records, "summary": summary}, f, indent=2)
 
     print("\n" + "=" * 80)
-    print("HEADROOM CURVE  (gap = RTN - exact, as fraction of RTN distortion)")
+    print("HEADROOM CURVE   (pooled = ratio-of-sums; med = per-row median, "
+          "nontrivial-gap rows)")
+    print("gap = RTN - exact, as fraction of RTN distortion")
     print("=" * 80)
-    print(f"{'d_prime':>8} {'n':>6} {'gap%':>8} {'gap%_med':>9} "
-          f"{'CLC/gap':>9} {'rank1%':>8} {'offdiag%':>9}")
+    print(f"{'d_prime':>7} {'n':>5} {'ntv':>5} {'gap%':>7} {'gap%_med':>9} "
+          f"{'CLC/gap':>8} {'CLC_med':>8} {'rank1%':>8} {'offdiag%':>9}")
     for c in summary["headroom_curve"]:
-        print(f"{c['dprime']:>8} {c['n']:>6} "
-              f"{c['gap_frac_mean']*100:>7.2f}% "
+        print(f"{c['dprime']:>7} {c['n']:>5} {c['n_nontrivial_gap']:>5} "
+              f"{c['gap_frac_pooled']*100:>6.2f}% "
               f"{c['gap_frac_median']*100:>8.2f}% "
-              f"{c['clc_recovered_frac_of_gap_mean']*100:>8.1f}% "
-              f"{c['gap_rank_one_frac_mean']*100:>7.1f}% "
-              f"{c['gap_offdiag_frac_mean']*100:>8.1f}%")
+              f"{c['clc_recovered_frac_of_gap_pooled']*100:>7.1f}% "
+              f"{c['clc_of_gap_median']*100:>7.1f}% "
+              f"{c['gap_rank_one_frac_pooled']*100:>7.1f}% "
+              f"{c['gap_offdiag_frac_pooled']*100:>8.1f}%")
     print(f"\n✅ Saved {len(all_records)} records to {args.output_json}")
 
 
