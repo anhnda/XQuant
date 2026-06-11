@@ -628,6 +628,14 @@ def summarize(records):
                              if per_row_gap_frac.size else 0.0),
             "clc_of_gap_median": (float(np.median(per_row_clc_of_gap))
                                   if per_row_clc_of_gap.size else 0.0),
+            # ABSOLUTE scale -- needed to tell "real bit-width-robust headroom"
+            # from "ratio of two tiny numbers" at higher bit-width. Mean per-block
+            # distortion in raw units; compare across bits directly.
+            "dist_rtn_mean_abs": float(dist_rtn.mean()),
+            "dist_exact_mean_abs": float(np.array([r["dist_exact"] for r in rs]).mean()),
+            "gap_mean_abs": float(gap.mean()),
+            "dist_rtn_median_abs": float(np.median(dist_rtn)),
+            "gap_median_abs": float(np.median(gap)),
         })
     out["headroom_curve"] = curve
     return out
@@ -775,6 +783,10 @@ def main():
               f"{c['clc_of_gap_median']*100:>7.1f}% "
               f"{c['gap_rank_one_frac_pooled']*100:>7.1f}% "
               f"{c['gap_offdiag_frac_pooled']*100:>8.1f}%")
+        print(f"        {'':>5} {'':>5}  abs: dist_rtn(mean)={c['dist_rtn_mean_abs']:.3e} "
+              f"dist_exact(mean)={c['dist_exact_mean_abs']:.3e} "
+              f"gap(mean)={c['gap_mean_abs']:.3e} "
+              f"gap(med)={c['gap_median_abs']:.3e}")
     print(f"\n✅ Saved {len(all_records)} records to {args.output_json}")
 
 
