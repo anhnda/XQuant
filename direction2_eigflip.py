@@ -367,7 +367,7 @@ def main():
     p = argparse.ArgumentParser(
         description="Direction 2: rung-2 eigenspace-aware flip selection.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--d1-path", type=str, default="./direction1_headroom.py",
+    p.add_argument("--d1-path", type=str, default="./headroom_d1.py",
                    help="Path to the Direction-1 file (provides shared machinery).")
     p.add_argument("--model-path", type=str, default="./models/Mistral-7B-v0.3")
     p.add_argument("--output-json", type=str, default="./eigflip_d2_results.json")
