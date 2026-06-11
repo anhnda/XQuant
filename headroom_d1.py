@@ -462,10 +462,10 @@ def measure_layer_headroom(name, module, H, mu, bits, group_size,
     distortions and the Eq.(4) decomposition of the RTN->exact gap.
     Returns a list of per-(row, d') record dicts.
     """
-    W = module.weight.data.to(device)
+    W = module.weight.data.to(device).float()   # bf16 -> fp32 to match H/mu
     out_f, in_f = W.shape
-    H = H.to(device)
-    mu = mu.to(device)
+    H = H.to(device).float()
+    mu = mu.to(device).float()
     Sigma = H - torch.outer(mu, mu)
 
     # full-layer RTN once (consistent scale/zp/codes with the real pipeline)
@@ -631,6 +631,9 @@ def main():
                    help="d' <= this -> exhaustive 2^{d'}; above -> branch & bound.")
     p.add_argument("--max-layers", type=int, default=0,
                    help="0 = all Linear layers; else cap (for a quick run).")
+    p.add_argument("--sample-layers", type=int, default=0,
+                   help="0 = use all/capped layers; else randomly sample this many "
+                        "layers across the model (Direction-1 spot check).")
     p.add_argument("--layer-filter", type=str, default="",
                    help="Substring filter on layer name (e.g. 'mlp' or 'q_proj').")
     p.add_argument("--seed", type=int, default=42)
@@ -675,7 +678,12 @@ def main():
                   and not (('lm_head' in n.lower()) or n.endswith('lm_head'))]
     if args.layer_filter:
         all_linear = [(n, m) for n, m in all_linear if args.layer_filter in n]
-    if args.max_layers > 0:
+    if args.sample_layers > 0 and args.sample_layers < len(all_linear):
+        idx = sorted(random.Random(args.seed).sample(range(len(all_linear)),
+                                                      args.sample_layers))
+        all_linear = [all_linear[i] for i in idx]
+        print(f"  Sampled {len(all_linear)} layers across the model.")
+    elif args.max_layers > 0:
         all_linear = all_linear[:args.max_layers]
     print(f"\nTarget layers: {len(all_linear)}")
 
