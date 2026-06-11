@@ -350,13 +350,18 @@ def clc_block(w_I, w_int_I, s_I, zp_I, max_int, mu_I,
 
     # RTN residual on the block (Wq - W)
     w_dq = (w_int_I - zp_I) * s_I
-    e = w_dq - w_I                                   # [d']  residual
+    # Use the SAME sign convention as awq_js_xl.py: residual r = W - W_dq, and
+    # current rank-one state b = mu^T r. (clc_block previously used W_dq - W with
+    # a negated flip_dir but did NOT flip the prefix target / validity test, so
+    # the two conventions were inconsistent and CLC anti-optimized |b| ~67% of
+    # the time. Verified: this convention never worsens |b|.)
+    r = w_I - w_dq                                   # [d']  residual (W - W_dq)
+    b = float((mu_I * r).sum().item())               # rank-one channel state
 
-    # current rank-one channel state b = mu^T e  (scalar for this output row/block)
-    b = float((mu_I * e).sum().item())
-
-    # flip direction: anti-residual -> if e>0 we want to DECREMENT code, else INCREMENT
-    flip_dir = -torch.sign(e)
+    # flip_dir = sign(c - W_int): the direction that moves the code toward the
+    # un-rounded value (un-negated, matching the original).
+    c = w_I / s_I + zp_I
+    flip_dir = torch.sign(c - w_int_I)
     flip_dir = torch.where(flip_dir == 0, torch.ones_like(flip_dir), flip_dir)
 
     # impact of flipping coord i on b: delta_b = mu_i * flip_dir_i * s_i
@@ -372,7 +377,6 @@ def clc_block(w_I, w_int_I, s_I, zp_I, max_int, mu_I,
     valid = valid & (~_kneedle_outlier_mask(mu_I, knee_tolerance))
 
     # rounding regret = |c - round(c)| in [0, 0.5], closeness to 0.5 -> cheaper flip
-    c = w_I / s_I + zp_I
     regret = (c - w_int_I).abs()
     regret_masked = regret.clone()
     regret_masked[~valid] = -1.0
